@@ -14,7 +14,9 @@ import hudson.plugins.git.extensions.GitSCMExtension;
 import hudson.plugins.git.extensions.impl.BuildChooserSetting;
 import hudson.plugins.git.extensions.impl.LocalBranch;
 import hudson.util.StreamTaskListener;
+import java.io.File;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +25,7 @@ import java.util.TreeMap;
 import java.util.UUID;
 import jenkins.plugins.git.traits.BranchDiscoveryTrait;
 import jenkins.plugins.git.traits.IgnoreOnPushNotificationTrait;
+import jenkins.plugins.git.traits.TagDiscoveryTrait;
 import jenkins.scm.api.SCMHead;
 import jenkins.scm.api.SCMRevision;
 import jenkins.scm.api.SCMSource;
@@ -31,8 +34,6 @@ import static org.hamcrest.Matchers.*;
 import jenkins.scm.api.SCMSourceOwner;
 import jenkins.scm.api.metadata.PrimaryInstanceMetadataAction;
 import jenkins.scm.api.trait.SCMSourceTrait;
-import org.hamcrest.Matcher;
-import org.hamcrest.Matchers;
 import org.junit.Rule;
 import org.junit.Test;
 import org.jvnet.hudson.test.Issue;
@@ -94,6 +95,135 @@ public class AbstractGitSCMSourceTest {
         sampleRepo.git("commit", "--all", "--message=dev2");
         // After changing data:
         assertEquals("[SCMHead{'dev'}, SCMHead{'dev2'}, SCMHead{'master'}]", source.fetch(listener).toString());
+    }
+
+    @Issue("JENKINS-46207")
+    @Test
+    public void retrieveHeadsSupportsTagDiscovery_ignoreTagsWithoutTagDiscoveryTrait() throws Exception {
+        sampleRepo.init();
+        sampleRepo.git("checkout", "-b", "dev");
+        sampleRepo.write("file", "modified");
+        sampleRepo.git("commit", "--all", "--message=dev");
+        sampleRepo.git("tag", "lightweight");
+        sampleRepo.write("file", "modified2");
+        sampleRepo.git("commit", "--all", "--message=dev2");
+        sampleRepo.git("tag", "-a", "annotated", "-m", "annotated");
+        sampleRepo.write("file", "modified3");
+        sampleRepo.git("commit", "--all", "--message=dev3");
+        GitSCMSource source = new GitSCMSource(sampleRepo.toString());
+        TaskListener listener = StreamTaskListener.fromStderr();
+        // SCMHeadObserver.Collector.result is a TreeMap so order is predictable:
+        assertEquals("[]", source.fetch(listener).toString());
+        source.setTraits(Collections.<SCMSourceTrait>singletonList(new BranchDiscoveryTrait()));
+        assertEquals("[SCMHead{'dev'}, SCMHead{'master'}]", source.fetch(listener).toString());
+        // And reuse cache:
+        assertEquals("[SCMHead{'dev'}, SCMHead{'master'}]", source.fetch(listener).toString());
+        sampleRepo.git("checkout", "-b", "dev2");
+        sampleRepo.write("file", "modified again");
+        sampleRepo.git("commit", "--all", "--message=dev2");
+        // After changing data:
+        assertEquals("[SCMHead{'dev'}, SCMHead{'dev2'}, SCMHead{'master'}]", source.fetch(listener).toString());
+    }
+
+    @Issue("JENKINS-46207")
+    @Test
+    public void retrieveHeadsSupportsTagDiscovery_findTagsWithTagDiscoveryTrait() throws Exception {
+        sampleRepo.init();
+        sampleRepo.git("checkout", "-b", "dev");
+        sampleRepo.write("file", "modified");
+        sampleRepo.git("commit", "--all", "--message=dev-commit-message");
+        long beforeLightweightTag = System.currentTimeMillis();
+        sampleRepo.git("tag", "lightweight");
+        long afterLightweightTag = System.currentTimeMillis();
+        sampleRepo.write("file", "modified2");
+        sampleRepo.git("commit", "--all", "--message=dev2-commit-message");
+        long beforeAnnotatedTag = System.currentTimeMillis();
+        sampleRepo.git("tag", "-a", "annotated", "-m", "annotated");
+        long afterAnnotatedTag = System.currentTimeMillis();
+        sampleRepo.write("file", "modified3");
+        sampleRepo.git("commit", "--all", "--message=dev3-commit-message");
+        GitSCMSource source = new GitSCMSource(sampleRepo.toString());
+        source.setTraits(new ArrayList<SCMSourceTrait>());
+        TaskListener listener = StreamTaskListener.fromStderr();
+        // SCMHeadObserver.Collector.result is a TreeMap so order is predictable:
+        assertEquals("[]", source.fetch(listener).toString());
+        source.setTraits(Arrays.asList(new BranchDiscoveryTrait(), new TagDiscoveryTrait()));
+        Set<SCMHead> scmHeadSet = source.fetch(listener);
+        long now = System.currentTimeMillis();
+        for (SCMHead scmHead : scmHeadSet) {
+            if (scmHead instanceof GitTagSCMHead) {
+                GitTagSCMHead tagHead = (GitTagSCMHead) scmHead;
+                // FAT file system time stamps only resolve to 2 second boundary
+                // EXT3 file system time stamps only resolve to 1 second boundary
+                long fileTimeStampFuzz = isWindows() ? 2000L : 1000L;
+                if (scmHead.getName().equals("lightweight")) {
+                    long timeStampDelta = afterLightweightTag - tagHead.getTimestamp();
+                    assertThat(timeStampDelta, is(both(greaterThanOrEqualTo(0L)).and(lessThanOrEqualTo(afterLightweightTag - beforeLightweightTag + fileTimeStampFuzz))));
+                } else if (scmHead.getName().equals("annotated")) {
+                    long timeStampDelta = afterAnnotatedTag - tagHead.getTimestamp();
+                    assertThat(timeStampDelta, is(both(greaterThanOrEqualTo(0L)).and(lessThanOrEqualTo(afterAnnotatedTag - beforeAnnotatedTag + fileTimeStampFuzz))));
+                } else {
+                    fail("Unexpected tag head '" + scmHead.getName() + "'");
+                }
+            }
+        }
+        assertEquals("[SCMHead{'annotated'}, SCMHead{'dev'}, SCMHead{'lightweight'}, SCMHead{'master'}]", scmHeadSet.toString());
+        // And reuse cache:
+        assertEquals("[SCMHead{'annotated'}, SCMHead{'dev'}, SCMHead{'lightweight'}, SCMHead{'master'}]", source.fetch(listener).toString());
+        sampleRepo.git("checkout", "-b", "dev2");
+        sampleRepo.write("file", "modified again");
+        sampleRepo.git("commit", "--all", "--message=dev2");
+        // After changing data:
+        assertEquals("[SCMHead{'annotated'}, SCMHead{'dev'}, SCMHead{'dev2'}, SCMHead{'lightweight'}, SCMHead{'master'}]", source.fetch(listener).toString());
+    }
+
+    @Issue("JENKINS-46207")
+    @Test
+    public void retrieveHeadsSupportsTagDiscovery_onlyTagsWithoutBranchDiscoveryTrait() throws Exception {
+        sampleRepo.init();
+        sampleRepo.git("checkout", "-b", "dev");
+        sampleRepo.write("file", "modified");
+        sampleRepo.git("commit", "--all", "--message=dev");
+        sampleRepo.git("tag", "lightweight");
+        sampleRepo.write("file", "modified2");
+        sampleRepo.git("commit", "--all", "--message=dev2");
+        sampleRepo.git("tag", "-a", "annotated", "-m", "annotated");
+        sampleRepo.write("file", "modified3");
+        sampleRepo.git("commit", "--all", "--message=dev3");
+        GitSCMSource source = new GitSCMSource(sampleRepo.toString());
+        source.setTraits(new ArrayList<SCMSourceTrait>());
+        TaskListener listener = StreamTaskListener.fromStderr();
+        // SCMHeadObserver.Collector.result is a TreeMap so order is predictable:
+        assertEquals("[]", source.fetch(listener).toString());
+        source.setTraits(Collections.<SCMSourceTrait>singletonList(new TagDiscoveryTrait()));
+        assertEquals("[SCMHead{'annotated'}, SCMHead{'lightweight'}]", source.fetch(listener).toString());
+        // And reuse cache:
+        assertEquals("[SCMHead{'annotated'}, SCMHead{'lightweight'}]", source.fetch(listener).toString());
+    }
+
+    @Issue("JENKINS-45953")
+    @Test
+    public void retrieveRevisions() throws Exception {
+        sampleRepo.init();
+        sampleRepo.git("checkout", "-b", "dev");
+        sampleRepo.write("file", "modified");
+        sampleRepo.git("commit", "--all", "--message=dev");
+        sampleRepo.git("tag", "lightweight");
+        sampleRepo.write("file", "modified2");
+        sampleRepo.git("commit", "--all", "--message=dev2");
+        sampleRepo.git("tag", "-a", "annotated", "-m", "annotated");
+        sampleRepo.write("file", "modified3");
+        sampleRepo.git("commit", "--all", "--message=dev3");
+        GitSCMSource source = new GitSCMSource(sampleRepo.toString());
+        source.setTraits(new ArrayList<SCMSourceTrait>());
+        TaskListener listener = StreamTaskListener.fromStderr();
+        assertThat(source.fetchRevisions(listener), hasSize(0));
+        source.setTraits(Collections.<SCMSourceTrait>singletonList(new BranchDiscoveryTrait()));
+        assertThat(source.fetchRevisions(listener), containsInAnyOrder("dev", "master"));
+        source.setTraits(Collections.<SCMSourceTrait>singletonList(new TagDiscoveryTrait()));
+        assertThat(source.fetchRevisions(listener), containsInAnyOrder("annotated", "lightweight"));
+        source.setTraits(Arrays.asList(new BranchDiscoveryTrait(), new TagDiscoveryTrait()));
+        assertThat(source.fetchRevisions(listener), containsInAnyOrder("dev", "master", "annotated", "lightweight"));
     }
 
     public static abstract class ActionableSCMSourceOwner extends Actionable implements SCMSourceOwner {
@@ -193,7 +323,8 @@ public class AbstractGitSCMSourceTest {
         sampleRepo.git("commit", "--all", "--message=v3"); // dev
         // SCM.checkout does not permit a null build argument, unfortunately.
         Run<?,?> run = r.buildAndAssertSuccess(r.createFreeStyleProject());
-        GitSCMSource source = new GitSCMSource(null, sampleRepo.toString(), "", "*", "", true);
+        GitSCMSource source = new GitSCMSource(sampleRepo.toString());
+        source.setTraits(Arrays.asList(new BranchDiscoveryTrait(), new TagDiscoveryTrait()));
         StreamTaskListener listener = StreamTaskListener.fromStderr();
         // Test retrieval of branches:
         assertEquals("v2", fileAt("master", run, source, listener));
@@ -349,5 +480,9 @@ public class AbstractGitSCMSourceTest {
         UserRemoteConfig config = configs.get(0);
         assertEquals("origin", config.getName());
         assertEquals("+refs/heads/*:refs/remotes/origin/* +refs/merge-requests/*/head:refs/remotes/origin/merge-requests/*", config.getRefspec());
+    }
+
+    private boolean isWindows() {
+        return File.pathSeparatorChar == ';';
     }
 }
